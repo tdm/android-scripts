@@ -1,0 +1,54 @@
+#!/bin/bash
+
+find_topdir()
+{
+	while [ ! -d ".repo" ]; do
+		cd ".."
+		if [ $PWD = "/" ]; then
+			echo "Cannot find topdir"
+			exit 1
+		fi
+	done
+	pwd
+}
+
+SCHEME="ssh"
+GIT="git"
+if [ "$1" = "-t" ]; then
+	GIT="echo git"
+	shift
+fi
+if [ "$1" = "-h" ]; then
+	SCHEME="https"
+fi
+
+topdir=$(find_topdir)
+len=$(( ${#topdir} + 1 ))
+prj_path=${PWD:$len}
+
+prj_entry=$(repo manifest | grep "project .*path=\"$prj_path\"")
+if [ -z "$prj_entry" ]; then
+	echo "Cannot find project entry for $prj_path"
+	exit 1
+fi
+
+def_entry=$(repo manifest | grep "default ")
+def_remote_name=$(echo $def_entry | egrep -o "remote=([^ ]*)" | cut -d'"' -f2)
+def_remote_entry=$(repo manifest | grep "remote .*name=\"$def_remote_name\"")
+
+prj_name=$(echo $prj_entry | egrep -o "name=([^ ]*)" | cut -d'"' -f2)
+prj_remote_name=$(echo $prj_entry | egrep -o "remote=([^ ]*)" | cut -d'"' -f2)
+prj_revision=$(echo $prj_entry | egrep -o "revision=([^ ]*)" | cut -d'"' -f2)
+if [ -z "$prj_revision" ]; then
+	prj_revision=$(echo $def_entry | egrep -o "revision=([^ ]*)" | cut -d'"' -f2)
+fi
+prj_revision="${prj_revision##refs/heads/}"
+
+if [ -n "$prj_remote_name" ]; then
+	remote_entry=$(repo manifest | grep "remote .*name=\"$prj_remote_name\"")
+else
+	remote_entry=$(repo manifest | grep "remote .*name=\"$def_remote_name\"")
+fi
+remote_review=$(echo $remote_entry | egrep -o "review=([^ ]*)" | cut -d'"' -f2)
+
+$GIT push "$SCHEME://$remote_review:29418/$prj_name" "HEAD:refs/for/$prj_revision"

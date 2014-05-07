@@ -1,0 +1,266 @@
+#!/bin/bash -e
+
+# Acquire lock on source tree
+parent=$(ps h -o comm $PPID)
+if [ "$parent" != "flock" ]; then
+	exec flock ".lock" $0 "$@"
+fi
+
+usage()
+{
+	prog=$(basename $0)
+
+	echo ""
+	echo "Usage:"
+	echo "  $prog [options] <build_combo>"
+	echo ""
+	echo "  Options:"
+	echo "    -a  Automated build (check for clean working dir)"
+	echo "    -c  Clean output before build"
+	echo "        Given once, clean device output (out/target/product)"
+	echo "        Given twice, clean target output (out/target)"
+	echo "        Given thrice, clean all output (out)"
+	echo "    -C  Clean output after successful build"
+	echo "        Given once, clean device output (out/target/product)"
+	echo "        Given twice, clean target output (out/target)"
+	echo "        Given thrice, clean all output (out)"
+	echo "    -j  Specify -j value for make [CPUS]"
+	echo "    -l  Save build output to log file"
+	echo "    -o  Specify output directory"
+	echo "    -O  Specify Android out dir"
+	echo "    -s  Show commands"
+	echo "    -t  Specify make target [auto]"
+	echo "    -v  Specify version [none]"
+	echo ""
+	echo "Exit status: 0 on success, !0 on failure"
+	echo ""
+	echo "On success, output will be copied to \$TARGET_PRODUCT.zip."
+	echo ""
+	exit 1
+}
+
+# Tool locations
+# XXX: not darwin compatible
+CCACHE="prebuilts/misc/linux-x86/ccache/ccache"
+
+ccache_stats()
+{
+    # Calculate ccache stats
+    local ch=0
+    local cm=0
+    local ct=0
+    local cpct="NA"
+
+    OLDIFS="$IFS"
+    IFS=$'\n'
+    lines=($($CCACHE -s))
+    IFS="$OLDIFS"
+    for (( n=0; $n < ${#lines[*]}; n=$(($n+1)) )); do
+        line=${lines[$n]}
+        if [ "${line:0:9}" = "cache hit" ]; then
+            ch=$(( ch + $(echo $line | sed 's/[^0-9]*//') ))
+        elif [ "${line:0:10}" = "cache miss" ]; then
+            read -a fields <<<$line
+            cm=$(( cm + $(echo $line | sed 's/[^0-9]*//') ))
+        fi
+    done
+    IFS="$OLDIFS"
+    if [ -n "$ch" -a -n "$cm" ]; then
+        ct=$(($ch+$cm))
+    fi
+    if [ "$ct" -gt 0 ]; then
+            cpct=$((ch*100/ct))
+    fi
+
+    echo "ch=$ch"
+    echo "cm=$cm"
+    echo "ct=$ct"
+    echo "cpct=$cpct"
+}
+
+# Set some useful vars
+export USE_CCACHE=1
+export CPUS=$(grep "^processor" /proc/cpuinfo | wc -l)
+export MEM=$(cat /proc/meminfo | grep "^MemTotal" | grep -o "[0-9]*")
+
+# Find actual value for jobs.
+#   - No more than 8 jobs
+#   - No more than one job per cpu
+#   - No more than one job per 1.5gb
+max_jobs=8
+cpu_jobs="$CPUS"
+if [ "$cpu_jobs" -lt "$max_jobs" ]; then
+	max_jobs="$cpu_jobs"
+fi
+mem_jobs=$(($MEM/1572864))
+if [ "$mem_jobs" -lt "$max_jobs" ]; then
+	max_jobs="$mem_jobs"
+fi
+
+# Init options
+opt_automated=0
+opt_clean=0
+opt_postclean=0
+opt_jobs="$max_jobs"
+opt_log=0
+opt_outdir="."
+opt_outandroid=""
+opt_maketarget="auto"
+opt_showcommands=0
+opt_version=""
+while getopts "acCj:lo:O:st:v:" opt; do
+	case "$opt" in
+	a) opt_automated=1 ;;
+	c) opt_clean=$(($opt_clean+1)) ;;
+	C) opt_postclean=$(($opt_postclean+1)) ;;
+	j) opt_jobs="$OPTARG" ;;
+	l) opt_log=1 ;;
+	o) opt_outdir="$OPTARG" ;;
+	O) opt_outandroid="$OPTARG" ;;
+	s) opt_showcommands=1 ;;
+	t) opt_maketarget="$OPTARG" ;;
+	v) opt_version="$OPTARG" ;;
+	*) usage
+	esac
+done
+shift $(($OPTIND-1))
+if [ $# -ne 1 ]; then
+	usage
+fi
+
+if [ -n "$opt_outandroid" ]; then
+	export OUT_DIR_COMMON_BASE="$opt_outandroid"
+fi
+
+mkdir -p "$opt_outdir"
+
+# NB: "$combo" is used by build scripts
+build_combo="$1"
+project_device=$(echo $build_combo | cut -d'-' -f1)
+project=$(echo $project_device | cut -d'_' -f1)
+device=$(echo $project_device | cut -d'_' -f2)
+
+# Desired output files
+if [ -n "$opt_version" ]; then
+	out_name="${opt_outdir}/${project_device}-${opt_version}"
+else
+	out_name="${opt_outdir}/${project_device}"
+fi
+
+if [ "$opt_log" -ne 0 ]; then
+	rm -f "${out_name}.log"
+	exec >> "${out_name}.log" 2>&1
+fi
+
+if [ ! -d ".repo" ]; then
+	echo "Invalid build tree"
+	exit 1
+fi
+
+case "$opt_clean" in
+0) # Do nothing
+	;;
+1) # Clean device output
+	rm -rf "$OUT_DIR_COMMON_BASE/target/product"
+	;;
+2) # Clean target output
+	rm -rf "$OUT_DIR_COMMON_BASE/target"
+	;;
+*) # Clean all output
+	rm -rf "$OUT_DIR_COMMON_BASE"
+	;;
+esac
+
+# Detect make target
+if [ -z "$opt_maketarget" -o "$opt_maketarget" = "auto" ]; then
+	opt_maketarget="otapackage"
+	if [ -f "build/core/Makefile" ]; then
+		if grep -q "^bacon:" "build/core/Makefile"; then
+			opt_maketarget="bacon"
+		fi
+	fi
+fi
+
+if [ "$opt_showcommands" -ne 0 ]; then
+	opt_maketarget="showcommands $opt_maketarget"
+fi
+
+# Ensure working directory is clean
+if [ "$opt_automated" -ne 0 ]; then
+	android-repo status | grep -q "working directory clean"
+fi
+
+. build/envsetup.sh
+lunch "$build_combo"
+
+# Setup ccache
+if [ -z "$CCACHE_ROOT" ]; then
+	CCACHE_ROOT="$HOME"
+fi
+
+export CCACHE_DIR="$CCACHE_ROOT/.ccache-$project_device"
+if [ ! -d "$CCACHE_DIR" ]; then
+	mkdir -p "$CCACHE_DIR"
+	$CCACHE -M 8G
+fi
+
+# Clean some things
+rm -f $OUT/system/build.prop
+
+eval $(ccache_stats)
+sch=$ch
+scm=$cm
+sct=$ct
+scpct=$cpct
+
+# Do the build
+stime=$(date +%s)
+make -j${opt_jobs} ${opt_maketarget}
+etime=$(date +%s)
+
+# Find output zip
+built_zip=$(ls -t $OUT/*.zip | head -1)
+if [ ! -f "$built_zip" ]; then
+	echo "Error: cannot find built zip in $OUT"
+	exit 1
+fi
+
+# Copy output zip to well known place
+cp "$built_zip" "${out_name}.zip"
+
+# Calculate elapsed time
+elapsedsec=$((etime - stime))
+elapsed=$(printf "%02d:%02d" $((elapsedsec/60)) $((elapsedsec%60)))
+
+eval $(ccache_stats)
+ech=$ch
+ecm=$cm
+ect=$ct
+ecpct=$cpct
+
+dch=$((ech - sch))
+dcm=$((ecm - scm))
+dct=$((ect - sct))
+dcpct="NA"
+if [ "$dct" -gt 0 ]; then
+	dcpct=$((dch*100/dct))
+fi
+
+echo "Build complete."
+echo "elapsed time : $elapsed"
+echo "ccache totals: $ech/$ect ($ecpct%)"
+echo "ccache deltas: $dch/$dct ($dcpct%)"
+
+case "$opt_postclean" in
+0) # Do nothing
+	;;
+1) # Clean device output
+	rm -rf "$OUT_DIR_COMMON_BASE/target/product"
+	;;
+2) # Clean target output
+	rm -rf "$OUT_DIR_COMMON_BASE/target"
+	;;
+*) # Clean all output
+	rm -rf "$OUT_DIR_COMMON_BASE"
+	;;
+esac

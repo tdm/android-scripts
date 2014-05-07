@@ -1,0 +1,45 @@
+#!/bin/sh
+
+topdir=$(pwd)
+
+if [ "$#" -ne 1 ]; then
+	echo "Usage: $0 <create|restore>"
+	exit 1
+fi
+
+action="$1"
+
+create_tag()
+{
+	# XXX: should verify "git status" to ensure to uncommitted diffs
+	repo manifest -r | cat
+}
+
+restore_tag()
+{
+	while read line; do
+		prj_entry=$(echo $line | grep "<project ")
+		if [ -z "$prj_entry" ]; then
+			continue
+		fi
+		dir=$(echo $prj_entry | egrep -o "path=([^ ]*)" | cut -d'"' -f2)
+		tag=$(echo $prj_entry | egrep -o "revision=([^ ]*)" | cut -d'"' -f2)
+		if [ -z "$dir" -o -z "$tag" ]; then
+			echo "Malformed line $line"
+			continue
+		fi
+		if [ ! -d "$topdir/$dir" ]; then
+			echo "No such dir $dir"
+			continue
+		fi
+		echo "$dir -> $tag"
+		cd "$topdir/$dir"
+		git checkout "$tag"
+	done
+}
+
+case "$action" in
+	create) create_tag ;;
+	restore) restore_tag ;;
+	*) usage ;;
+esac

@@ -1,0 +1,240 @@
+#!/usr/bin/python
+
+import os
+import sys
+import getopt
+import subprocess
+import urllib2
+import json
+import re
+from xml.etree import ElementTree
+
+cfg = dict()
+cfg['nodo'] = False
+cfg['post'] = None
+cfg['remote'] = None
+cfg['revision'] = None
+cfg['ssh'] = False
+cfg['verbose'] = 0
+
+def verbose(s):
+    if cfg['verbose'] > 0:
+        sys.stderr.write(s)
+
+def get_topdir():
+    dir = os.getcwd()
+    while not os.path.exists("%s/.repo" % (dir)):
+        dir = os.path.realpath("%s/.." % (dir))
+        if dir == '/':
+            raise OSError(2, 'No such file or directory', dir)
+    return dir
+
+def usage():
+    print "Usage: gerrit-fetch [args] <change-num>"
+    print "  --nodo     Do not apply the change"
+    print "  --post     Apply change after fetching (cherry-pick|merge)"
+    print "  --remote   Use specified remote"
+    print "  --revision Use specified change revision"
+    print "  --ssh      Use ssh, do not attempt http"
+    print "  --verbose  Increase verbose level"
+    sys.exit(1)
+
+optargs, argv = getopt.getopt(sys.argv[1:], 'np:sv',
+        ['nodo', 'post=', 'remote=', 'revision=', 'ssh', 'verbose'])
+for k, v in optargs:
+    if k in ('-n', '--nodo'):
+        cfg['nodo'] = True
+    if k in ('-p', '--post'):
+        cfg['post'] = v
+    if k in ('--remote'):
+        cfg['remote'] = v
+    if k in ('--revision'):
+        cfg['revision'] = v
+    if k in ('-s', '--ssh'):
+        cfg['ssh'] = True
+    if k in ('-v', '--verbose'):
+        cfg['verbose'] += 1
+
+if not cfg['post'] is None:
+    if cfg['post'] != 'cherry-pick' and cfg['post'] != 'merge':
+        usage()
+
+if len(argv) != 1:
+    usage()
+
+change_number = int(argv[0])
+
+cur_dir = os.getcwd()
+print "cur_dir=%s" % (cur_dir)
+prj_dir = None
+try:
+    top_dir = get_topdir()
+except OSError:
+    sys.stderr.write("Cannot find top of android tree\n")
+    sys.exit(1)
+print "top_dir=%s" % (top_dir)
+if len(top_dir) < len(cur_dir):
+    prj_dir = cur_dir[len(top_dir)+1:]
+    print "prj_dir=%s" % (prj_dir)
+
+# Read our manifest
+args = []
+args.append('repo')
+args.append('manifest')
+child = subprocess.Popen(args, stdin=None, stdout=subprocess.PIPE, stderr=None)
+out, err = child.communicate()
+if child.returncode != 0:
+    sys.stderr.write('Failed to read manifest\n')
+    sys.exit(1)
+manifest = ElementTree.fromstring(out)
+
+# Figure out which remote to use
+remote_name = cfg['remote']
+if remote_name is None:
+    if prj_dir is None:
+        for elem in manifest.findall('default'):
+            cfg['remote'] = elem.get('name')
+    else:
+        for elem in manifest.findall('project'):
+            if elem.get('path') == prj_dir:
+                remote_name = elem.get('remote')
+if remote_name is None:
+    sys.stderr.write("Cannot find appropriate remote entry in manifest\n");
+    sys.exit(1);
+verbose("remote_name=%s\n" % (remote_name))
+
+review_url = None
+review_host = None
+for elem in manifest.findall('remote'):
+    if elem.get('name') == remote_name:
+        review_url = elem.get('review')
+        if review_url.find(':') == -1:
+            review_host = review_url
+            review_url = "http://%s" % (review_url)
+        else:
+            review_host = review_url.strip_url_schema()
+if review_url is None or review_host is None:
+    sys.stderr.write("Cannot find appropriate remote url in manifest\n");
+    sys.exit(1);
+verbose("review_url=%s, review_host=%s\n" % (review_url, review_host))
+
+# Fetch the change props
+props = None
+project_name = None
+change_revision = cfg['revision']
+if not cfg['ssh']:
+    try:
+        # NB: o=DOWNLOAD_COMMANDS is not reliable so don't use it
+        url = '%s/changes/?q=%d&o=CURRENT_REVISION' % (review_url, change_number)
+        verbose("Attempting to fetch change from url=%s\n" % (url))
+        response = urllib2.urlopen(url)
+        doc = response.read()
+        if not doc.startswith(")]}'\n"):
+            sys.stderr.write('Error: malformed change props (url=%s)\n' % (url))
+            raise Exception('Malformed change props')
+        proplist = json.loads(doc[5:])
+        if len(proplist) == 1:
+            verbose("proplist loads and has one element\n");
+            props = proplist[0]
+            project_name = props['project']
+            if change_revision is None:
+                change_rev_id = props['current_revision']
+                change_rev = None
+                for rev in props['revisions']:
+                    if rev == change_rev_id:
+                        change_revision = props['revisions'][rev]['_number']
+    except:
+        sys.stderr.write('Failed to fetch change props\n')
+
+if project_name is None:
+    args = []
+    args.append('ssh')
+    args.append(review_host)
+    args.append('gerrit')
+    args.append('query')
+    args.append('--format=JSON')
+    args.append('--current-patch-set')
+    args.append("%d" %(change_number))
+    verbose("Attempting to fetch change from cmd=\"%s\"\n" % (" ".join(args)))
+    child = subprocess.Popen(args, stdin=None, stdout=subprocess.PIPE, stderr=None)
+    out, err = child.communicate()
+    if child.returncode != 0:
+        sys.stderr.write('Failed to read manifest\n')
+        sys.exit(1)
+    lines = out.split('\n')
+    props = json.loads(lines[0])
+    project_name = props['project']
+    if change_revision is None:
+        change_revision = props['currentPatchSet']['number']
+
+    # If we used ssh to access the change, also use ssh to fetch it
+    review_url = "ssh://%s" % (review_host)
+
+if project_name is None:
+    sys.stderr.write('Error: cannot fetch change properties\n')
+    sys.exit(1)
+verbose("project=%s\n" % (project_name))
+
+if change_revision is None:
+    sys.stderr.write('Error: cannot fetch change revision\n')
+    sys.exit(1)
+verbose("change_revision=%s\n" % (change_revision))
+
+project = None
+for elem in manifest.findall('project'):
+    if elem.get('name') == project_name:
+        project = elem
+if project is None:
+    sys.stderr.write('Error: project not found\n')
+    sys.exit(1)
+project_path = project.get('path')
+
+if prj_dir is None:
+    # Switch to the project directory
+    verbose("Switching to project directory %s\n" % (project_path))
+    try:
+        os.chdir(project_path)
+    except:
+        sys.stderr.write('Error: path not found\n')
+        sys.exit(1)
+else:
+    # Verify correct directory
+    verbose("Verifying project directory %s vs %s\n" % (project_path, prj_dir))
+    if prj_dir != project_path:
+        sys.stderr.write("Error: change applies to %s, we are in %s\n" % (project_path, prj_dir))
+        sys.exit(1)
+
+change_hash = "%02d" % (change_number % 100)
+
+# Fetch the change
+args = []
+args.append('git')
+args.append('fetch')
+args.append('%s/%s' % (review_url, project_name))
+args.append('refs/changes/%s/%s/%s' % (change_hash, change_number, change_revision))
+if cfg['nodo']:
+    print ' '.join(args)
+else:
+    child = subprocess.Popen(args, stdin=None, stdout=None, stderr=None)
+    out, err = child.communicate()
+    if child.returncode != 0:
+        sys.stderr.write('Failed to fetch change\n')
+        sys.exit(1)
+
+if not cfg['post'] is None:
+    # Pick the change
+    args = []
+    args.append('git')
+    args.append(cfg['post'])
+    args.append('FETCH_HEAD')
+    if cfg['nodo']:
+        print ' '.join(args)
+    else:
+        child = subprocess.Popen(args, stdin=None, stdout=None, stderr=None)
+        out, err = child.communicate()
+        if child.returncode != 0:
+            sys.stderr.write("Failed to %s change\n" % (cfg['post']))
+            sys.exit(1)
+
+verbose('Success\n')
+sys.exit(0)

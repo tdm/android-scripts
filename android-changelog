@@ -1,0 +1,264 @@
+#!/usr/bin/python
+
+import os
+import sys
+import getopt
+import subprocess
+from xml.etree import ElementTree
+
+def read_manifest(file):
+    manifest = ElementTree.parse(file)
+    defaults = manifest.findall('default')[0]
+    for project in manifest.findall('project'):
+        if not 'remote' in project.attrib:
+            project.attrib['remote'] = defaults.attrib['remote']
+        if not 'revision' in project.attrib:
+            project.attrib['revision'] = defaults.attrib['revision']
+    return manifest
+
+def manifest_defaults(manifest):
+    defaults = dict()
+
+    defaults['remote'] = ''
+    defaults['revision'] = ''
+    for e in manifest.findall('default'):
+        if 'remote' in e:
+            defaults['remote'] = e.attrib['remote']
+        if 'revision' in e:
+            defaults['revision'] = e.attrib['revision']
+
+    oldpwd = os.getcwd()
+    os.chdir('.repo/manifests')
+    pipe = subprocess.Popen(['git', 'remote', '-v'], stdout=subprocess.PIPE)
+    line = pipe.stdout.readline()
+    fields = line.split()
+    defaults['fetch'] = os.path.dirname(fields[1])
+    os.chdir(oldpwd)
+
+    return defaults
+
+def manifest_remotes(manifest, defaults):
+    remotes = dict()
+    for e in manifest.findall('remote'):
+        if not 'name' in e.attrib:
+            print "ERROR: remote with no name attrib"
+            continue
+        name = e.attrib['name']
+        if not 'fetch' in e.attrib:
+            print "ERROR: remote with no fetch attrib"
+            continue
+        e.attrib['fetch'] = e.attrib['fetch'].rstrip('/')
+        if e.attrib['fetch'] == '.':
+            e.attrib['fetch'] = defaults['fetch']
+        if e.attrib['fetch'] == '..':
+            e.attrib['fetch'] = os.path.dirname(defaults['fetch'])
+        remotes[name] = e
+    return remotes
+
+def manifest_projects(manifest, remotes, defaults):
+    projects = dict()
+    for e in manifest.findall('project'):
+        if not 'name' in e.attrib:
+            print "ERROR: project with no name attrib"
+            continue
+        if not 'path' in e.attrib:
+            e.attrib['path'] = e.attrib['name']
+        path = e.attrib['path']
+        if path in projects:
+            print "ERROR: duplicate project path %s" % path
+            continue
+        if not 'remote' in e.attrib:
+            e.attrib['remote'] = defaults['remote']
+        remote_name = e.attrib['remote']
+        r = remotes[remote_name]
+        e.attrib['remote_url'] = r.attrib['fetch'] + '/' + e.attrib['name']
+        projects[path] = e
+    return projects
+
+def is_same_project(p1, p2):
+    if p1.attrib['path'] != p2.attrib['path']:
+        return False
+    if p1.attrib['remote_url'] != p2.attrib['remote_url']:
+        return False
+    return True
+
+def run_git_in_dir(path, args):
+    pipe = os.popen("chdir %s && git %s" % (path, args))
+    lines = pipe.readlines()
+    pipe.close()
+    return lines
+
+class TextEmitter:
+    def emit_header(self, f1, f2):
+        print "# Changelog"
+        print "# Created ..."
+        print "# %s vs %s" % (f1, f2)
+
+    def emit_footer(self):
+        # empty
+        pass
+
+    def emit_project_change_header(self):
+        print "=" * 72
+        print "Project changes ..."
+
+    def emit_project_change_text(self, text):
+        print "%s" % text
+
+    def emit_project_change_footer(self):
+        print ""
+
+    def emit_dir_changes_header(self, name, r1, r2):
+        print "=" * 72
+        print "Changes in %s [%s .. %s]" % (name, r1, r2)
+        print "=" * 72
+        print ""
+
+    def emit_dir_changes_text(self, remote_url, text):
+        for line in text:
+            print line.rstrip()
+
+    def emit_dir_changes_footer(self):
+        print ""
+
+class HtmlEmitter:
+    def emit_header(self, f1, f2):
+        print "<html>"
+        print " <head>"
+        print "  <title>Changelog</title>"
+        print " </head>"
+        print " <body>"
+
+    def emit_footer(self):
+        print " </body>"
+        print "</html>"
+
+    def emit_project_change_header(self):
+        print "  <h3>Project changes</h3>"
+        print "  <hr>"
+
+    def emit_project_change_text(self, text):
+        print "  %s<br>" % text
+
+    def emit_project_change_footer(self):
+        # empty
+        pass
+
+    def emit_dir_changes_header(self, name, r1, r2):
+        print "  <h3>Changes in %s [%s .. %s]</h3>" % (name, r1, r2)
+        print "  <hr>"
+
+    def emit_dir_changes_text(self, remote_url, text):
+        print "  <pre>"
+        for line in text:
+            txt = line.rstrip()
+            if line[0:7] == 'commit ' and remote_url.find('github.com') != -1:
+                id = line[7:]
+                lnk = '%s/commit/%s' % (remote_url, id)
+                txt = '<a href="%s">%s</a>' % (lnk, id)
+            print "  %s" % txt
+        print "  </pre>"
+
+    def emit_dir_changes_footer(self):
+        # empty
+        pass
+
+fmt = 'text'
+showmerges = False
+short = False
+
+opts, args = getopt.getopt(sys.argv[1:], 'f:ms', ['format=', 'show-merges', 'short'])
+for k, v in opts:
+    if k in ('-f', '--format'):
+        fmt = v
+    if k in ('-m', '--show-merges'):
+        showmerges = True
+    if k in ('-s', '--short'):
+        short = True
+
+if len(args) != 2:
+    print "Usage: %s [-f text|html] [-m] manifest1 manifest2"
+    sys.exit(1)
+
+f1 = args[0]
+f2 = args[1]
+manifest1 = read_manifest(f1)
+manifest2 = read_manifest(f2)
+defaults1 = manifest_defaults(manifest1)
+defaults2 = manifest_defaults(manifest2)
+remotes1 = manifest_remotes(manifest1, defaults1)
+remotes2 = manifest_remotes(manifest2, defaults2)
+projects1 = manifest_projects(manifest1, remotes1, defaults1)
+projects2 = manifest_projects(manifest2, remotes2, defaults2)
+
+diffable_projects = []
+changed_projects = []
+new_projects = []
+del_projects = []
+
+for path in projects1.iterkeys():
+    if path in projects2:
+        p1 = projects1[path]
+        p2 = projects2[path]
+        if is_same_project(p1, p2):
+            diffable_projects.append(path)
+        else:
+            changed_projects.append(path)
+    else:
+        del_projects.append(path)
+
+for path in projects2.iterkeys():
+    if not path in projects1:
+        new_projects.append(path)
+
+if fmt == 'text':
+    emitter = TextEmitter()
+else:
+    emitter = HtmlEmitter()
+
+emitter.emit_header(f1, f2)
+
+if len(new_projects) > 0 or len(del_projects) > 0 or len(changed_projects) > 0:
+    emitter.emit_project_change_header()
+
+    for path in new_projects:
+        remote_url = projects2[path].attrib['remote_url']
+        emitter.emit_project_change_text("new project %s: %s" % (path, remote_url))
+
+    for path in del_projects:
+        remote_url = projects1[path].attrib['remote_url']
+        emitter.emit_project_change_text("deleted project %s: %s" % (path, remote_url))
+
+    for path in changed_projects:
+        old_remote_url = projects1[path].attrib['remote_url']
+        new_remote_url = projects2[path].attrib['remote_url']
+        emitter.emit_project_change_text("changed project %s: %s => %s" % (path, old_remote_url, new_remote_url))
+
+    emitter.emit_project_change_footer()
+
+for path in sorted(diffable_projects):
+    p1 = projects1[path]
+    r1 = p1.attrib['revision']
+    p2 = projects2[path]
+    r2 = p2.attrib['revision']
+    if r1 != r2:
+        lines = run_git_in_dir(path, "show --pretty=format:%%h %s" % (r1))
+        r1a = lines[0].rstrip('\n')
+        lines = run_git_in_dir(path, "show --pretty=format:%%h %s" % (r2))
+        r2a = lines[0].rstrip('\n')
+        gitargs = "log "
+        if not showmerges:
+            gitargs += "--no-merges "
+        if short:
+            gitargs += "--pretty=oneline "
+        else:
+            gitargs += "--pretty=short "
+        gitargs += "--abbrev-commit "
+        gitargs += "%s..%s" % (p1.attrib['revision'], p2.attrib['revision'])
+        lines = run_git_in_dir(path, gitargs)
+        if len(lines) > 0:
+            emitter.emit_dir_changes_header(path, r1a, r2a)
+            emitter.emit_dir_changes_text(p1.attrib['remote_url'], lines)
+            emitter.emit_dir_changes_footer()
+
+emitter.emit_footer()
