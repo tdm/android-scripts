@@ -1,54 +1,146 @@
-#!/bin/bash
+#!/usr/bin/python
 
-find_topdir()
-{
-	while [ ! -d ".repo" ]; do
-		cd ".."
-		if [ $PWD = "/" ]; then
-			echo "Cannot find topdir"
-			exit 1
-		fi
-	done
-	pwd
-}
+import os
+import sys
+import getopt
+import subprocess
+import urllib2
+import json
+import re
+from xml.etree import ElementTree
 
-SCHEME="ssh"
-GIT="git"
-if [ "$1" = "-t" ]; then
-	GIT="echo git"
-	shift
-fi
-if [ "$1" = "-h" ]; then
-	SCHEME="https"
-fi
+cfg = dict()
+cfg['draft'] = False
+cfg['nodo'] = False
+cfg['ssh'] = False
+cfg['remote'] = None
+cfg['verbose'] = 0
 
-topdir=$(find_topdir)
-len=$(( ${#topdir} + 1 ))
-prj_path=${PWD:$len}
+def verbose(s):
+    if cfg['verbose'] > 0:
+        sys.stderr.write(s)
 
-prj_entry=$(repo manifest | grep "project .*path=\"$prj_path\"")
-if [ -z "$prj_entry" ]; then
-	echo "Cannot find project entry for $prj_path"
-	exit 1
-fi
+def get_topdir():
+    dir = os.getcwd()
+    while not os.path.exists("%s/.repo" % (dir)):
+        dir = os.path.realpath("%s/.." % (dir))
+        if dir == '/':
+            raise OSError(2, 'No such file or directory', dir)
+    return dir
 
-def_entry=$(repo manifest | grep "default ")
-def_remote_name=$(echo $def_entry | egrep -o "remote=([^ ]*)" | cut -d'"' -f2)
-def_remote_entry=$(repo manifest | grep "remote .*name=\"$def_remote_name\"")
+optargs, argv = getopt.getopt(sys.argv[1:], 'dnsv',
+        ['draft', 'nodo', 'remote=', 'ssh', 'verbose'])
+for k, v in optargs:
+    if k in ('-d', '--draft'):
+        cfg['draft'] = True
+    if k in ('-n', '--nodo'):
+        cfg['nodo'] = True
+    if k in ('--remote'):
+        cfg['remote'] = v
+    if k in ('-s', '--ssh'):
+        cfg['ssh'] = True
+    if k in ('-v', '--verbose'):
+        cfg['verbose'] += 1
 
-prj_name=$(echo $prj_entry | egrep -o "name=([^ ]*)" | cut -d'"' -f2)
-prj_remote_name=$(echo $prj_entry | egrep -o "remote=([^ ]*)" | cut -d'"' -f2)
-prj_revision=$(echo $prj_entry | egrep -o "revision=([^ ]*)" | cut -d'"' -f2)
-if [ -z "$prj_revision" ]; then
-	prj_revision=$(echo $def_entry | egrep -o "revision=([^ ]*)" | cut -d'"' -f2)
-fi
-prj_revision="${prj_revision##refs/heads/}"
+if len(argv) != 0:
+    print "Usage: gerrit-push [args]"
+    print "  --draft    Push as draft"
+    print "  --nodo     Do not apply the change"
+    print "  --remote   Use specified remote"
+    print "  --ssh      Use ssh, do not attempt http"
+    print "  --verbose  Increase verbose level"
+    sys.exit(1)
 
-if [ -n "$prj_remote_name" ]; then
-	remote_entry=$(repo manifest | grep "remote .*name=\"$prj_remote_name\"")
-else
-	remote_entry=$(repo manifest | grep "remote .*name=\"$def_remote_name\"")
-fi
-remote_review=$(echo $remote_entry | egrep -o "review=([^ ]*)" | cut -d'"' -f2)
+cur_dir = os.getcwd()
+verbose("cur_dir=%s" % (cur_dir))
+prj_dir = None
+try:
+    top_dir = get_topdir()
+except OSError:
+    sys.stderr.write("Cannot find top of android tree\n")
+    sys.exit(1)
+verbose("top_dir=%s" % (top_dir))
+if len(top_dir) >= len(cur_dir):
+    sys.stderr.write("Not in project directory\n")
+    sys.exit(1)
+prj_dir = cur_dir[len(top_dir)+1:]
+verbose("prj_dir=%s" % (prj_dir))
 
-$GIT push "$SCHEME://$remote_review:29418/$prj_name" "HEAD:refs/for/$prj_revision"
+# Read our manifest
+args = []
+args.append('repo')
+args.append('manifest')
+child = subprocess.Popen(args, stdin=None, stdout=subprocess.PIPE, stderr=None)
+out, err = child.communicate()
+if child.returncode != 0:
+    sys.stderr.write('Failed to read manifest\n')
+    sys.exit(1)
+manifest = ElementTree.fromstring(out)
+
+# Figure out which remote to use
+remote_name = cfg['remote']
+if remote_name is None:
+    if prj_dir is None:
+        for elem in manifest.findall('default'):
+            cfg['remote'] = elem.get('name')
+    else:
+        for elem in manifest.findall('project'):
+            if elem.get('path') == prj_dir:
+                remote_name = elem.get('remote')
+if remote_name is None:
+    sys.stderr.write("Cannot find appropriate remote entry in manifest\n");
+    sys.exit(1);
+verbose("remote_name=%s\n" % (remote_name))
+
+review_url = None
+review_host = None
+for elem in manifest.findall('remote'):
+    if elem.get('name') == remote_name:
+        review_url = elem.get('review')
+        if review_url.find(':') == -1:
+            review_host = review_url
+            review_url = "ssh://%s" % (review_url)
+        else:
+            review_host = review_url.strip_url_schema()
+if review_url is None or review_host is None:
+    sys.stderr.write("Cannot find appropriate remote url in manifest\n");
+    sys.exit(1);
+verbose("review_url=%s, review_host=%s\n" % (review_url, review_host))
+
+project = None
+for elem in manifest.findall('project'):
+    if elem.get('path') == prj_dir:
+        project = elem
+if project is None:
+    sys.stderr.write('Error: project not found\n')
+    sys.exit(1)
+project_path = project.get('path')
+project_name = project.get('name')
+
+# Figure out which branch to use
+project_branch = project.get('revision')
+if project_branch is None:
+    for elem in manifest.findall('default'):
+        project_branch = elem.get('revision')
+if project_branch is None:
+    sys.stderr.write("Cannot find project branch in manifest\n");
+    sys.exit(1);
+verbose("project_branch=%s\n" % (project_branch))
+
+# Push the change
+args = []
+args.append('git')
+args.append('push')
+args.append('%s/%s' % (review_url, project_name))
+args.append('HEAD:refs/for/%s' % (project_branch))
+if cfg['nodo']:
+    print ' '.join(args)
+else:
+    child = subprocess.Popen(args, stdin=None, stdout=None, stderr=None)
+    out, err = child.communicate()
+    if child.returncode != 0:
+        sys.stderr.write('Failed to push change\n')
+        sys.exit(1)
+
+verbose('Success\n')
+sys.exit(0)
