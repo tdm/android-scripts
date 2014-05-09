@@ -80,13 +80,13 @@ manifest = ElementTree.fromstring(out)
 # Figure out which remote to use
 remote_name = cfg['remote']
 if remote_name is None:
-    if prj_dir is None:
-        for elem in manifest.findall('default'):
-            cfg['remote'] = elem.get('name')
-    else:
+    if not prj_dir is None:
         for elem in manifest.findall('project'):
             if elem.get('path') == prj_dir:
                 remote_name = elem.get('remote')
+    if remote_name is None:
+        for elem in manifest.findall('default'):
+            remote_name = elem.get('remote')
 if remote_name is None:
     sys.stderr.write("Cannot find appropriate remote entry in manifest\n");
     sys.exit(1);
@@ -125,6 +125,8 @@ if project_branch is None:
 if project_branch is None:
     sys.stderr.write("Cannot find project branch in manifest\n");
     sys.exit(1);
+if project_branch.startswith('refs/heads/'):
+    project_branch = project_branch[11:]
 verbose("project_branch=%s\n" % (project_branch))
 
 # Push the change

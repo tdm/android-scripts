@@ -65,17 +65,17 @@ if len(argv) != 1:
 change_number = int(argv[0])
 
 cur_dir = os.getcwd()
-print "cur_dir=%s" % (cur_dir)
+verbose("cur_dir=%s\n" % (cur_dir))
 prj_dir = None
 try:
     top_dir = get_topdir()
 except OSError:
     sys.stderr.write("Cannot find top of android tree\n")
     sys.exit(1)
-print "top_dir=%s" % (top_dir)
+verbose("top_dir=%s\n" % (top_dir))
 if len(top_dir) < len(cur_dir):
     prj_dir = cur_dir[len(top_dir)+1:]
-    print "prj_dir=%s" % (prj_dir)
+    verbose("prj_dir=%s\n" % (prj_dir))
 
 # Read our manifest
 args = []
@@ -91,13 +91,13 @@ manifest = ElementTree.fromstring(out)
 # Figure out which remote to use
 remote_name = cfg['remote']
 if remote_name is None:
-    if prj_dir is None:
-        for elem in manifest.findall('default'):
-            cfg['remote'] = elem.get('name')
-    else:
+    if not prj_dir is None:
         for elem in manifest.findall('project'):
             if elem.get('path') == prj_dir:
                 remote_name = elem.get('remote')
+    if remote_name is None:
+        for elem in manifest.findall('default'):
+            remote_name = elem.get('remote')
 if remote_name is None:
     sys.stderr.write("Cannot find appropriate remote entry in manifest\n");
     sys.exit(1);
