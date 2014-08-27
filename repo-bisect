@@ -1,0 +1,214 @@
+#!/usr/bin/python
+
+import os
+import sys
+import getopt
+import subprocess
+import urllib2
+import json
+import re
+import datetime
+import xml.etree.ElementTree as ElementTree
+
+cfg = dict()
+cfg['verbose'] = 0
+cfg['nosync'] = False
+
+def verbose(s):
+    if cfg['verbose'] > 0:
+        sys.stderr.write(s)
+
+def date_from_string(s):
+    ymd = s.split('-')
+    return datetime.datetime(int(ymd[0]), int(ymd[1]), int(ymd[2]))
+
+def git_config(key):
+    args = ['git', 'config', key]
+    child = subprocess.Popen(args, stdin=None, stdout=subprocess.PIPE, stderr=None)
+    out, err = child.communicate()
+    if child.returncode != 0:
+        sys.stderr.write('Failed to read git config\n')
+        sys.exit(1)
+    return out.strip()
+
+def git_reset_hard(rev):
+    args = ['git', 'reset', '--hard', rev]
+    child = subprocess.Popen(args, stdin=None, stdout=subprocess.PIPE, stderr=None)
+    out, err = child.communicate()
+    if child.returncode != 0:
+        sys.stderr.write('Failed to read git log\n')
+        sys.exit(1)
+
+def git_checkout(rev):
+    args = ['git', 'checkout', rev]
+    child = subprocess.Popen(args, stdin=None, stdout=subprocess.PIPE, stderr=None)
+    out, err = child.communicate()
+    if child.returncode != 0:
+        sys.stderr.write('Failed to read git log\n')
+        sys.exit(1)
+
+def git_rev_by_date(date, branch):
+    args = ['git', 'rev-list', '--max-count=1']
+    args.append('--until=%s' % (date))
+    args.append(branch)
+    child = subprocess.Popen(args, stdin=None, stdout=subprocess.PIPE, stderr=None)
+    out, err = child.communicate()
+    if child.returncode != 0:
+        sys.stderr.write('Failed to read git log\n')
+        sys.exit(1)
+    if not out:
+        sys.stderr.write('Failed to find rev')
+        sys.exit(1)
+    return out.strip()
+
+def repo_manifest():
+    args = []
+    args.append('repo')
+    args.append('manifest')
+    child = subprocess.Popen(args, stdin=None, stdout=subprocess.PIPE, stderr=None)
+    out, err = child.communicate()
+    if child.returncode != 0:
+        sys.stderr.write('Failed to read manifest\n')
+        sys.exit(1)
+    return ElementTree.fromstring(out)
+
+def repo_sync_to_date(date):
+    print "bisect: sync to %s" % (state['start'])
+
+    # Set manifest revision
+    os.chdir('.repo/manifests')
+    remote = git_config('branch.default.remote')
+    branch = git_config('branch.default.merge')
+    rev = git_rev_by_date(date, '%s/%s' % (remote, branch))
+    print "rev at %s = %s" % (date, rev)
+    git_reset_hard(rev)
+    os.chdir(cwd)
+
+    # Fetch the manifest
+    manifest = repo_manifest()
+
+    # Find default remote and revision
+    for elem in manifest.findall('default'):
+        def_remote = elem.get('remote')
+        def_revision = elem.get('revision')
+        if def_revision.startswith('refs/heads/'):
+            # refs/heads/branch => branch
+            def_revision = def_revision.split('/')[2]
+
+    # Update manifest revisions
+    for elem in manifest.findall('project'):
+        project_name = elem.get('name')
+        project_path = elem.get('path', project_name)
+        os.chdir(project_path)
+        project_remote = elem.get('remote', def_remote)
+        project_revision = elem.get('revision', def_revision)
+        if project_revision.startswith('refs/tags'):
+            manifest_revision = project_revision.split('/')[2]
+        else:
+            manifest_revision = "%s/%s" % (project_remote, project_revision)
+        rev = git_rev_by_date(date, manifest_revision)
+        elem.set('revision', rev)
+        os.chdir(cwd)
+
+    # Write new manifest
+    pathname = "%s/.repo/manifests/bisect-%s.xml" % (cwd, date)
+
+    ElementTree.ElementTree(manifest).write(pathname)
+
+    # Sync
+    have_local = os.path.exists('.repo/local_manifests')
+    if have_local:
+        os.rename('.repo/local_manifests', '.repo/local_manifests.hide')
+
+    args = ['repo', 'sync', '-l', '-m', pathname]
+    child = subprocess.Popen(args, stdin=None, stdout=subprocess.PIPE, stderr=None)
+    out, err = child.communicate()
+    if child.returncode != 0:
+        sys.stderr.write('Failed to sync\n')
+
+    if have_local:
+        os.rename('.repo/local_manifests.hide', '.repo/local_manifests')
+
+def state_read():
+    s = dict()
+    f = open('.repo/bisect', 'r')
+    for line in f:
+        k,v = line.strip().split('=')
+        s[k] = v
+    f.close()
+    return s
+
+def state_write(s):
+    f = open('.repo/bisect', 'w')
+    f.write("start=%s\n" % (s['start']))
+    f.write("end=%s\n" % (s['end']))
+    f.close()
+
+def state_delete():
+    os.unlink('.repo/bisect')
+
+def usage():
+    print "Usage:"
+    print "  repo-bisect [args] start yyyy-mm-dd yyyy-mm-dd"
+    print "  repo-bisect [args] <good|bad|reset>"
+    print "    --verbose  Increase verbose level"
+    sys.exit(1)
+
+optargs, argv = getopt.getopt(sys.argv[1:], 'v',
+        ['verbose', 'nosync'])
+for k, v in optargs:
+    if k in ('-n', '--nosync'):
+        cfg['nosync'] = True
+    if k in ('-v', '--verbose'):
+        cfg['verbose'] += 1
+
+cwd = os.getcwd()
+if not os.path.exists('.repo'):
+    sys.stderr.write("Not a repo\n")
+    sys.exit(1)
+
+if len(argv) < 1:
+    usage()
+
+action = argv[0]
+if action == 'start':
+    if len(argv) < 3:
+        usage()
+    state = dict()
+    state['start'] = argv[1]
+    state['end'] = argv[2]
+    state_write(state)
+    if not cfg['nosync']:
+        repo_sync_to_date(state['start'])
+if action == 'good':
+    state = state_read()
+    d1 = date_from_string(state['start'])
+    d2 = date_from_string(state['end'])
+    delta = (d2 - d1) / 2
+    if delta.days < 1:
+        print "No more dates left to test"
+        sys.exit(0)
+    mid = d1 + delta
+    state['start'] = "%s-%s-%s" % (mid.year, mid.month, mid.day)
+    state_write(state)
+    print "bisect: start=%s, end=%s" % (state['start'], state['end'])
+    if not cfg['nosync']:
+        repo_sync_to_date(state['start'])
+if action == 'bad':
+    state = state_read()
+    d1 = date_from_string(state['start'])
+    d2 = date_from_string(state['end'])
+    delta = (d2 - d1) / 2
+    if delta.days < 1:
+        print "No more dates left to test"
+        sys.exit(0)
+    mid = d1 + delta
+    state['end'] = "%s-%s-%s" % (mid.year, mid.month, mid.day)
+    state_write(state)
+    print "bisect: start=%s, end=%s" % (state['start'], state['end'])
+    if not cfg['nosync']:
+        repo_sync_to_date(state['start'])
+if action == 'reset':
+    state_delete()
+
+sys.exit(0)
