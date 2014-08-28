@@ -14,13 +14,56 @@ cfg = dict()
 cfg['verbose'] = 0
 cfg['nosync'] = False
 
+cwd = os.getcwd()
+if not os.path.exists('.repo'):
+    sys.stderr.write("Not a repo\n")
+    sys.exit(1)
+
 def verbose(s):
     if cfg['verbose'] > 0:
         sys.stderr.write(s)
 
-def date_from_string(s):
-    ymd = s.split('-')
-    return datetime.datetime(int(ymd[0]), int(ymd[1]), int(ymd[2]))
+# Valid formats:
+#   YYYY-MM-DD-HH-MM-SS
+#   YYYY-MM-DD-HH
+#   YYYY-MM-DD
+def string_to_datetime(s):
+    fields = s.split('-')
+    if len(fields) == 6:
+        return datetime.datetime(int(fields[0]), int(fields[1]), int(fields[2]),
+                                 int(fields[3]), int(fields[4]), int(fields[5]))
+    if len(fields) == 4:
+        return datetime.datetime(int(fields[0]), int(fields[1]), int(fields[2]),
+                                 int(fields[3]))
+    if len(fields) == 3:
+        return datetime.datetime(int(fields[0]), int(fields[1]), int(fields[2]))
+    return None
+
+def datetime_to_string(dt):
+    if dt.hour == 0 and dt.minute == 0 and dt.second == 0:
+        return dt.strftime("%Y-%m-%d")
+    return dt.strftime("%Y-%m-%d-%H-%M-%S")
+
+# Find mid point between two datetime objects.
+#
+# Granularity is 1 hour.
+#
+# If the objects differ by less than 2 hours, exit.
+#
+# If the objects differ by at least 2 days and both hour components are
+# zero, the resulting hour component will be zero.
+def datetime_mid(d1, d2):
+    delta = (d2 - d1) / 2
+    if delta.total_seconds() < 3600:
+        print "No more dates left to test"
+        sys.exit(0)
+    mid = d1 + delta
+    if mid.minute != 0 or mid.second != 0:
+        mid = mid.replace(minute=0, second=0)
+    if delta.total_seconds() > 86400 and d1.hour == 0 and d2.hour == 0:
+        if mid.hour != 0:
+            mid = mid.replace(hour=0)
+    return mid
 
 def git_config(key):
     args = ['git', 'config', key]
@@ -36,7 +79,7 @@ def git_reset_hard(rev):
     child = subprocess.Popen(args, stdin=None, stdout=subprocess.PIPE, stderr=None)
     out, err = child.communicate()
     if child.returncode != 0:
-        sys.stderr.write('Failed to read git log\n')
+        sys.stderr.write('Failed to reset git tree\n')
         sys.exit(1)
 
 def git_checkout(rev):
@@ -44,7 +87,7 @@ def git_checkout(rev):
     child = subprocess.Popen(args, stdin=None, stdout=subprocess.PIPE, stderr=None)
     out, err = child.communicate()
     if child.returncode != 0:
-        sys.stderr.write('Failed to read git log\n')
+        sys.stderr.write('Failed to checkout git tree\n')
         sys.exit(1)
 
 def git_rev_by_date(date, branch):
@@ -73,15 +116,15 @@ def repo_manifest():
     return ElementTree.fromstring(out)
 
 def repo_sync_to_date(date):
-    print "bisect: sync to %s" % (state['start'])
+    print "bisect: sync to %s" % (date)
 
     # Set manifest revision
     os.chdir('.repo/manifests')
     remote = git_config('branch.default.remote')
     branch = git_config('branch.default.merge')
-    rev = git_rev_by_date(date, '%s/%s' % (remote, branch))
-    print "rev at %s = %s" % (date, rev)
-    git_reset_hard(rev)
+    manifest_rev = git_rev_by_date(date, '%s/%s' % (remote, branch))
+    verbose("manifest revision %s\n" % (manifest_rev))
+    git_reset_hard(manifest_rev)
     os.chdir(cwd)
 
     # Fetch the manifest
@@ -99,23 +142,31 @@ def repo_sync_to_date(date):
     for elem in manifest.findall('project'):
         project_name = elem.get('name')
         project_path = elem.get('path', project_name)
-        os.chdir(project_path)
         project_remote = elem.get('remote', def_remote)
         project_revision = elem.get('revision', def_revision)
         if project_revision.startswith('refs/tags'):
             manifest_revision = project_revision.split('/')[2]
         else:
             manifest_revision = "%s/%s" % (project_remote, project_revision)
+        os.chdir(".repo/projects/%s.git" % (project_path))
         rev = git_rev_by_date(date, manifest_revision)
-        elem.set('revision', rev)
         os.chdir(cwd)
+        elem.set('revision', rev)
 
     # Write new manifest
     pathname = "%s/.repo/manifests/bisect-%s.xml" % (cwd, date)
 
     ElementTree.ElementTree(manifest).write(pathname)
 
-    # Sync
+    # Sync the working tree.  Note:
+    #
+    #  - Both "repo manifest" and "repo sync -m" include local manifests,
+    #    so we must move the local manifests out of the way temporarily
+    #    to avoid duplicate project errors.
+    #
+    #  - "repo sync" always syncs up the main manifest (even with -m), so
+    #    we must reset the main manifest after we sync.
+
     have_local = os.path.exists('.repo/local_manifests')
     if have_local:
         os.rename('.repo/local_manifests', '.repo/local_manifests.hide')
@@ -128,6 +179,10 @@ def repo_sync_to_date(date):
 
     if have_local:
         os.rename('.repo/local_manifests.hide', '.repo/local_manifests')
+
+    os.chdir('.repo/manifests')
+    git_reset_hard(manifest_rev)
+    os.chdir(cwd)
 
 def state_read():
     s = dict()
@@ -154,6 +209,8 @@ def usage():
     print "    --verbose  Increase verbose level"
     sys.exit(1)
 
+### Main code ###
+
 optargs, argv = getopt.getopt(sys.argv[1:], 'v',
         ['verbose', 'nosync'])
 for k, v in optargs:
@@ -161,11 +218,6 @@ for k, v in optargs:
         cfg['nosync'] = True
     if k in ('-v', '--verbose'):
         cfg['verbose'] += 1
-
-cwd = os.getcwd()
-if not os.path.exists('.repo'):
-    sys.stderr.write("Not a repo\n")
-    sys.exit(1)
 
 if len(argv) < 1:
     usage()
@@ -182,28 +234,20 @@ if action == 'start':
         repo_sync_to_date(state['start'])
 if action == 'good':
     state = state_read()
-    d1 = date_from_string(state['start'])
-    d2 = date_from_string(state['end'])
-    delta = (d2 - d1) / 2
-    if delta.days < 1:
-        print "No more dates left to test"
-        sys.exit(0)
-    mid = d1 + delta
-    state['start'] = "%s-%s-%s" % (mid.year, mid.month, mid.day)
+    d1 = string_to_datetime(state['start'])
+    d2 = string_to_datetime(state['end'])
+    mid = datetime_mid(d1, d2)
+    state['start'] = datetime_to_string(mid)
     state_write(state)
     print "bisect: start=%s, end=%s" % (state['start'], state['end'])
     if not cfg['nosync']:
         repo_sync_to_date(state['start'])
 if action == 'bad':
     state = state_read()
-    d1 = date_from_string(state['start'])
-    d2 = date_from_string(state['end'])
-    delta = (d2 - d1) / 2
-    if delta.days < 1:
-        print "No more dates left to test"
-        sys.exit(0)
-    mid = d1 + delta
-    state['end'] = "%s-%s-%s" % (mid.year, mid.month, mid.day)
+    d1 = string_to_datetime(state['start'])
+    d2 = string_to_datetime(state['end'])
+    mid = datetime_mid(d1, d2)
+    state['end'] = datetime_to_string(mid)
     state_write(state)
     print "bisect: start=%s, end=%s" % (state['start'], state['end'])
     if not cfg['nosync']:
