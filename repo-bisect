@@ -184,6 +184,16 @@ def repo_sync_to_date(date):
     git_reset_hard(manifest_rev)
     os.chdir(cwd)
 
+def state_to_mid(state):
+    d1 = string_to_datetime(state['start'])
+    d2 = string_to_datetime(state['end'])
+    mid = datetime_mid(d1, d2)
+    return datetime_to_string(mid)
+
+def repo_sync_to_mid(state):
+    mid = state_to_mid(state)
+    repo_sync_to_date(mid)
+
 def state_read():
     s = dict()
     f = open('.repo/bisect', 'r')
@@ -231,27 +241,21 @@ if action == 'start':
     state['end'] = argv[2]
     state_write(state)
     if not cfg['nosync']:
-        repo_sync_to_date(state['start'])
+        repo_sync_to_mid(state)
 if action == 'good':
     state = state_read()
-    d1 = string_to_datetime(state['start'])
-    d2 = string_to_datetime(state['end'])
-    mid = datetime_mid(d1, d2)
-    state['start'] = datetime_to_string(mid)
+    state['start'] = state_to_mid(state)
     state_write(state)
     print "bisect: start=%s, end=%s" % (state['start'], state['end'])
     if not cfg['nosync']:
-        repo_sync_to_date(state['start'])
+        repo_sync_to_mid(state)
 if action == 'bad':
     state = state_read()
-    d1 = string_to_datetime(state['start'])
-    d2 = string_to_datetime(state['end'])
-    mid = datetime_mid(d1, d2)
-    state['end'] = datetime_to_string(mid)
+    state['end'] = state_to_mid(state)
     state_write(state)
     print "bisect: start=%s, end=%s" % (state['start'], state['end'])
     if not cfg['nosync']:
-        repo_sync_to_date(state['start'])
+        repo_sync_to_mid(state)
 if action == 'reset':
     state_delete()
 
