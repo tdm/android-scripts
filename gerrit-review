@@ -1,0 +1,197 @@
+#!/usr/bin/python
+
+import os
+import sys
+import re
+import getopt
+import json
+import subprocess
+
+scriptname = os.path.basename(sys.argv[0])
+
+cfg = dict()
+cfg['abandon'] = False
+cfg['code-review'] = ''
+cfg['nodo'] = False
+cfg['submit'] = False
+cfg['verify'] = ''
+cfg['verbose'] = 0
+
+def verbose(s):
+    if cfg['verbose'] > 0:
+        sys.stderr.write(s)
+
+class Enum(set):
+    def __getattr__(self, name):
+        if name in self:
+            return name
+        raise AttributeError
+
+ArgType = Enum(['ID', 'COMMIT', 'CHANGE', 'QUERY'])
+
+def get_arg_type(arg):
+    if re.match('^I[0-9A-Fa-f]{40}$', arg):
+        return ArgType.ID
+    if re.match('^[0-9A-Fa-f]{40}$', arg):
+        return ArgType.COMMIT
+    if re.match('^[0-9]{1,8},[0-9]{1,4}$', arg) or re.match('^[0-9]{1,8}$', arg):
+        return ArgType.CHANGE
+    return ArgType.QUERY
+
+def gerrit_list(host, query):
+    argv = ['ssh', host, 'gerrit', 'query', '--format=JSON', query]
+    verbose("exec: %s\n" % (' '.join(argv)))
+    child = subprocess.Popen(argv, stdin=None, stdout=subprocess.PIPE, stderr=None)
+    out, err = child.communicate()
+    if child.returncode != 0:
+        raise RuntimeError('Failed to execute %s\n' % (' '.join(argv)))
+    res = []
+    for line in out.split('\n'):
+        if not line:
+            continue
+        try:
+            j = json.loads(line)
+            if 'id' in j:
+                res.append(j)
+        except:
+            print "Failed to parse line: %s" % (line)
+    return res
+
+def gerrit_change_props(host, queryarg, id):
+    argv = []
+    argv.append('ssh')
+    argv.append(host)
+    argv.append('gerrit')
+    argv.append('query')
+    argv.append('--format=JSON')
+    argv.append(queryarg)
+    argv.append("%s" %(id))
+    verbose("exec: %s\n" % (' '.join(argv)))
+    child = subprocess.Popen(argv, stdin=None, stdout=subprocess.PIPE, stderr=None)
+    out, err = child.communicate()
+    if child.returncode != 0:
+        sys.stderr.write('Failed to read manifest\n')
+        sys.exit(1)
+    lines = out.split('\n')
+    props = json.loads(lines[0])
+    return props
+
+def gerrit_review(host, id):
+    argv = ['ssh', host, 'gerrit', 'review', id]
+    if cfg['abandon']:
+        argv.append('--abandon')
+    if cfg['code-review']:
+        argv.extend(['--code-review', cfg['code-review']])
+    if cfg['verify']:
+        argv.extend(['--verified', cfg['verify']])
+    if cfg['submit']:
+        argv.append('--submit')
+    verbose("exec: %s\n" % (' '.join(argv)))
+    if not cfg['nodo']:
+        child = subprocess.Popen(argv, stdin=None, stdout=None, stderr=None)
+        out, err = child.communicate()
+        if child.returncode != 0:
+            print "Error: Failed to review change %s" % (id)
+            print "Command: %s" % (' '.join(argv))
+            raise RuntimeError('Review failed')
+
+def usage():
+    print "Usage:"
+    print "  %s [args] <host> <change-id> ..." % (scriptname)
+    print "  %s [args] <host> <change-num[,patchset]> ..." % (scriptname)
+    print "  %s [args] <host> <commit-hash> ..." % (scriptname)
+    print "  %s [args] <host> <query>" % (scriptname)
+    print "    --abandon           Abandon change"
+    print "    --code-review <n>   Set code-review"
+    print "    --cr <n>            Alias for --code-review"
+    print "    --merge             Alias for --code-review=+2 --verify=+1 --submit"
+    print "    --nodo              Do not make any changes on the server"
+    print "    --submit            Submit change"
+    print "    --verbose           Increase verbose level"
+    print "    --verify <n>        Set verify"
+    print ""
+    print "Examples:"
+    print "  %s --cr=+1 gerrit.example.com 12345" % (scriptname)
+    print "  %s --merge gerrit.example.com status:open owner:superdev@example.com label:code-review=+1" % (scriptname)
+    sys.exit(1)
+
+optargs, argv = getopt.getopt(sys.argv[1:], 'ac:mnsv',
+        ['abandon', 'code-review=', 'cr=', 'merge', 'nodo', 'submit', 'verbose', 'verify='])
+for k, v in optargs:
+    if k in ('-a', '--abandon'):
+        cfg['abandon'] = True
+    if k in ('-c', '--cr', '--code-review'):
+        cfg['code-review'] = v
+    if k in ('-m', '--merge'):
+        cfg['code-review'] = '+2'
+        cfg['verify'] = '+1'
+        cfg['submit'] = True
+    if k in ('-n', '--nodo'):
+        cfg['nodo'] = True
+    if k in ('-s', '--submit'):
+        cfg['submit'] = True
+    if k in ('-v', '--verbose'):
+        cfg['verbose'] += 1
+    if k in ('--verify'):
+        cfg['verify'] = v
+
+if len(argv) < 2:
+    usage()
+
+host = argv.pop(0)
+
+if not (cfg['abandon'] or cfg['code-review'] or cfg['verify'] or cfg['submit']):
+    print "Error: No actions specified"
+    print ""
+    usage()
+
+argtype = get_arg_type(argv[0])
+for arg in argv:
+    t = get_arg_type(arg)
+    if t != argtype:
+        usage()
+
+changes = []
+if argtype == ArgType.ID:
+    # Change-Id: use the current patch set
+    for arg in argv:
+        props = gerrit_change_props(host, '--current-patch-set', arg)
+        change = "%s,%s" % (props['number'], props['currentPatchSet']['number'])
+        changes.append(change)
+elif argtype == ArgType.COMMIT:
+    # Commit hash: find the patch set
+    for arg in argv:
+        props = gerrit_change_props(host, '--patch-sets', arg)
+        change_num = props['number']
+        patch_num = ''
+        for ps in props['patchSets']:
+            if ps['revision'] == arg:
+                patch_num = ps['number']
+                break
+        if not patch_num:
+            print "Error: Cannot find patch number for commit %s" % (arg)
+            sys.exit(1)
+        change = "%s,%s" % (change_num, patch_num)
+        changes.append(change)
+elif argtype == ArgType.CHANGE:
+    # Change-Number: use the current patch set if not provided
+    for arg in argv:
+        if ',' in arg:
+            change = arg
+        else:
+            props = gerrit_change_props(host, '--current-patch-set', arg)
+            change = "%s,%s" % (arg, props['currentPatchSet']['number'])
+        changes.append(change)
+elif argtype == ArgType.QUERY:
+    # Query: use the current patch set for each result
+    res = gerrit_list(host, ' '.join(argv))
+    for item in res:
+        props = gerrit_change_props(host, '--current-patch-set', item['id'])
+        change = "%s,%s" % (props['number'], props['currentPatchSet']['number'])
+        changes.append(change)
+else:
+    print "Internal Error: Unhandled argument type."
+    sys.exit(1)
+
+for change in changes:
+    gerrit_review(host, change)
