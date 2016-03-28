@@ -76,16 +76,10 @@ def gerrit_change_props(host, queryarg, id):
     props = json.loads(lines[0])
     return props
 
-def gerrit_review(host, id):
-    argv = ['ssh', host, 'gerrit', 'review', id]
-    if cfg['abandon']:
-        argv.append('--abandon')
-    if cfg['code-review']:
-        argv.extend(['--code-review', cfg['code-review']])
-    if cfg['verify']:
-        argv.extend(['--verified', cfg['verify']])
-    if cfg['submit']:
-        argv.append('--submit')
+def gerrit_review(host, ids, args):
+    argv = ['ssh', host, 'gerrit', 'review']
+    argv.extend(ids)
+    argv.extend(args)
     verbose("exec: %s\n" % (' '.join(argv)))
     if not cfg['nodo']:
         child = subprocess.Popen(argv, stdin=None, stdout=None, stderr=None)
@@ -140,10 +134,16 @@ if len(argv) < 2:
 
 host = argv.pop(0)
 
-if not (cfg['abandon'] or cfg['code-review'] or cfg['verify'] or cfg['submit']):
-    print "Error: No actions specified"
-    print ""
-    usage()
+if cfg['abandon']:
+    if cfg['code-review'] or cfg['verify'] or cfg['submit']:
+        print "Error: Cannot combine abandon with other actions"
+        print ""
+        usage()
+else:
+    if not (cfg['code-review'] or cfg['verify'] or cfg['submit']):
+        print "Error: No actions specified"
+        print ""
+        usage()
 
 argtype = get_arg_type(argv[0])
 for arg in argv:
@@ -193,5 +193,20 @@ else:
     print "Internal Error: Unhandled argument type."
     sys.exit(1)
 
-for change in changes:
-    gerrit_review(host, change)
+# Handle code-review and verified
+if cfg['code-review'] or cfg['verify']:
+    args = []
+    if cfg['code-review']:
+        args.extend(['--code-review', cfg['code-review']])
+    if cfg['verify']:
+        args.extend(['--verified', cfg['verify']])
+    gerrit_review(host, changes, args)
+
+# Handle submit and abandon
+if cfg['submit'] or cfg['verify']:
+    args = []
+    if cfg['submit']:
+        args.append('--submit')
+    if cfg['abandon']:
+        args.append('--abandon')
+    gerrit_review(host, changes, args)
